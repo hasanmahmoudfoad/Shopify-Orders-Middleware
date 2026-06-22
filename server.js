@@ -510,7 +510,6 @@ app.get('/orders/:id', async (req, res) => {
     }))
   );
   res.send(`
-    <!doctype html>
     <html>
     <head>
       <meta charset="utf-8" />
