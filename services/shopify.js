@@ -1,444 +1,645 @@
-// Lightweight Shopify GraphQL service used by server.js
-// Loads credentials from process.env or ./app.env (via dotenv)
+const crypto = require('crypto');
 const fetch = require('node-fetch');
+const fs = require('fs');
 const path = require('path');
 
-// Load app.env if present (safe; won't override existing env vars)
+const envPath = path.join(__dirname, '..', 'app.env');
+
 try {
-  require('dotenv').config({ path: path.join(__dirname, '..', 'app.env') });
-} catch (e) {
-  // dotenv not installed; fallback to simple parser of app.env
-  try {
-    const fs = require('fs');
-    const envPath = path.join(__dirname, '..', 'app.env');
-    if (fs.existsSync(envPath)) {
-      const content = fs.readFileSync(envPath, 'utf8');
-      content.split(/\r?\n/).forEach(line => {
-        const m = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)\s*$/);
-        if (m) {
-          const key = m[1];
-          let val = m[2] || '';
-          // remove surrounding quotes
-          if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-            val = val.slice(1, -1);
-          }
-          if (!process.env[key]) process.env[key] = val;
-        }
-      });
-    }
-  } catch (e2) {
-    /* ignore */
+  require('dotenv').config({ path: envPath });
+} catch (error) {
+  if (fs.existsSync(envPath)) {
+    fs.readFileSync(envPath, 'utf8').split(/\r?\n/).forEach(line => {
+      const match = line.match(/^\s*([A-Za-z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (!match || process.env[match[1]]) return;
+      let value = match[2] || '';
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      process.env[match[1]] = value;
+    });
   }
 }
 
 const SHOP = process.env.SHOPIFY_STORE;
-const API_VER = process.env.SHOPIFY_API_VERSION || '2026-04';
-
-if (!SHOP) {
-  console.warn('services/shopify: SHOPIFY_STORE not set. API calls will fail until provided.');
-}
-
-const GRAPHQL_URL = SHOP ? `https://${SHOP}/admin/api/${API_VER}/graphql.json` : null;
-
-// Token management: check existing env values and refresh when expired or missing.
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-04';
+const GRAPHQL_URL = SHOP ? `https://${SHOP}/admin/api/${API_VERSION}/graphql.json` : null;
 const TOKEN_ENDPOINT = SHOP ? `https://${SHOP}/admin/oauth/access_token` : null;
 
-function readExpiryFromEnv() {
-  const v = process.env.SHOPIFY_ACCESS_TOKEN_EXPIRES_AT;
-  if (!v) return 0;
-  const n = Number(v);
-  if (!n || Number.isNaN(n)) return 0;
-  return n;
+function toOrderGid(id) {
+  const value = String(id || '');
+  return value.startsWith('gid://') ? value : `gid://shopify/Order/${value}`;
 }
 
-async function persistTokenToAppEnv(token, expiresAt) {
-  // try to write back to app.env next to project root if present so manual inspection works
+function toLocationGid(id) {
+  const value = String(id || '');
+  return value.startsWith('gid://') ? value : `gid://shopify/Location/${value}`;
+}
+
+function createIdempotencyKey() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${crypto.randomBytes(16).toString('hex')}`;
+}
+
+function readTokenExpiry() {
+  return Number(process.env.SHOPIFY_ACCESS_TOKEN_EXPIRES_AT || 0);
+}
+
+function persistToken(token, expiresAt) {
   try {
-    const fs = require('fs');
-    const p = path.join(__dirname, '..', 'app.env');
-    let content = '';
-    if (fs.existsSync(p)) content = fs.readFileSync(p, 'utf8');
-
-    const setOrAdd = (key, value, src) => {
-      const re = new RegExp('^' + key + '\\s*=.*$', 'm');
-      if (re.test(src)) {
-        return src.replace(re, `${key}=${value}`);
-      }
-      if (src && !src.endsWith('\n')) src += '\n';
-      return src + `${key}=${value}\n`;
-    };
-
-    content = setOrAdd('SHOPIFY_ACCESS_TOKEN', token, content);
-    content = setOrAdd('SHOPIFY_ACCESS_TOKEN_EXPIRES_AT', String(expiresAt), content);
-
-    fs.writeFileSync(p, content, 'utf8');
-  } catch (e) {
-    // non-fatal
-    // console.warn('Could not persist token to app.env', e);
+    let content = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+    for (const [key, value] of Object.entries({
+      SHOPIFY_ACCESS_TOKEN: token,
+      SHOPIFY_ACCESS_TOKEN_EXPIRES_AT: expiresAt
+    })) {
+      const pattern = new RegExp(`^${key}\\s*=.*$`, 'm');
+      content = pattern.test(content)
+        ? content.replace(pattern, `${key}=${value}`)
+        : `${content}${content && !content.endsWith('\n') ? '\n' : ''}${key}=${value}\n`;
+    }
+    fs.writeFileSync(envPath, content, 'utf8');
+  } catch (error) {
+    console.warn('Could not persist refreshed Shopify token:', error.message);
   }
 }
 
-async function requestNewAccessToken() {
-  if (!TOKEN_ENDPOINT) throw new Error('Token endpoint not available (SHOPIFY_STORE missing)');
+async function requestAccessToken() {
+  if (!TOKEN_ENDPOINT) throw new Error('SHOPIFY_STORE is not configured');
   const clientId = process.env.SHOPIFY_CLIENT_ID;
   const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
-  const grant = process.env.GRANT_TYPE || 'client_credentials';
-  if (!clientId || !clientSecret) throw new Error('SHOPIFY_CLIENT_ID or SHOPIFY_CLIENT_SECRET missing from environment');
+  if (!clientId || !clientSecret) throw new Error('Shopify client credentials are missing');
 
-  const body = JSON.stringify({
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: grant
-  });
-
-  const res = await fetch(TOKEN_ENDPOINT, {
+  const response = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: process.env.GRANT_TYPE || 'client_credentials'
+    })
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Token request failed: ${res.status} ${res.statusText} ${text}`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.access_token) {
+    throw new Error(body.error_description || body.error || `Token request failed (${response.status})`);
   }
 
-  const json = await res.json();
-  const accessToken = json.access_token || json.accessToken || json.token;
-  const expiresIn = Number(json.expires_in || json.expires || 0);
-  if (!accessToken) throw new Error('Token response did not include access_token');
-
-  // expiresAt in epoch ms
-  const expiresAt = expiresIn > 0 ? (Date.now() + (expiresIn * 1000)) : 0;
-
-  // persist to process.env for runtime usage
-  process.env.SHOPIFY_ACCESS_TOKEN = accessToken;
+  const expiresAt = body.expires_in ? Date.now() + Number(body.expires_in) * 1000 : 0;
+  process.env.SHOPIFY_ACCESS_TOKEN = body.access_token;
   process.env.SHOPIFY_ACCESS_TOKEN_EXPIRES_AT = String(expiresAt);
-
-  // try to persist to app.env for transparency
-  persistTokenToAppEnv(accessToken, expiresAt).catch(() => {});
-
-  return { accessToken, expiresAt, expiresIn };
+  persistToken(body.access_token, expiresAt);
+  return body.access_token;
 }
 
-async function ensureAccessToken() {
-  const current = process.env.SHOPIFY_ACCESS_TOKEN;
-  const expiresAt = readExpiryFromEnv();
-  const now = Date.now();
-
-  if (current && expiresAt && now < expiresAt - 5000) {
-    // token exists and not expired (5s buffer)
-    return current;
-  }
-
-  // request new token
-  const t = await requestNewAccessToken();
-  return t.accessToken;
-}
-
-function toGidOrder(id) {
-  if (!id) return id;
-  const s = String(id);
-  if (s.startsWith('gid://')) return s;
-  return `gid://shopify/Order/${s}`;
+async function accessToken() {
+  const token = process.env.SHOPIFY_ACCESS_TOKEN;
+  const expiresAt = readTokenExpiry();
+  if (token && (!expiresAt || Date.now() < expiresAt - 5000)) return token;
+  return requestAccessToken();
 }
 
 async function graphql(query, variables = {}) {
-  if (!GRAPHQL_URL) throw new Error('Shopify store not configured (SHOPIFY_STORE)');
-  const token = await ensureAccessToken();
-  const res = await fetch(GRAPHQL_URL, {
+  if (!GRAPHQL_URL) throw new Error('SHOPIFY_STORE is not configured');
+  const response = await fetch(GRAPHQL_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': token
+      'X-Shopify-Access-Token': await accessToken()
     },
     body: JSON.stringify({ query, variables })
   });
-  const json = await res.json();
-  if (json.errors) {
-    // GraphQL-level errors
-    throw new Error(JSON.stringify(json.errors));
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Shopify request failed (${response.status})`);
+  if (body.errors?.length) {
+    console.error('[Shopify GraphQL errors]', JSON.stringify(body.errors));
+    throw new Error(body.errors.map(error => error.message).join('; '));
   }
-  return json.data;
+  return body.data;
 }
 
-async function addTagsToOrder(orderId, tags = []) {
-  const gid = toGidOrder(orderId);
-  // Shopify OrderInput often accepts tags as a comma-separated string
-  const tagsString = Array.isArray(tags) ? tags.join(', ') : String(tags || '');
-  const mutation = `
-    mutation orderUpdate($input: OrderInput!) {
-      orderUpdate(input: $input) {
-        order { id tags }
-        userErrors { field message }
-      }
+function assertUserErrors(payload, label) {
+  const errors = payload?.userErrors || [];
+  if (!errors.length) return payload;
+  console.warn('[Shopify userErrors]', JSON.stringify({ label, errors }));
+  const error = new Error(errors.map(item => item.message).join('; '));
+  error.code = errors[0].code;
+  error.field = errors[0].field;
+  error.statusCode = error.code === 'STALE_OBJECT' ? 409 : 400;
+  error.message = `${label}: ${error.message}`;
+  throw error;
+}
+
+async function getAccessScopes() {
+  const data = await graphql(`query AccessScopes {
+    currentAppInstallation {
+      accessScopes { handle }
     }
-  `;
-  const variables = { input: { id: gid, tags: tagsString } };
-  return graphql(mutation, variables);
+  }`);
+  return data.currentAppInstallation.accessScopes.map(scope => scope.handle);
 }
 
-async function addNoteToOrder(orderId, note = '') {
-  const gid = toGidOrder(orderId);
-  const mutation = `
-    mutation orderUpdate($input: OrderInput!) {
-      orderUpdate(input: $input) {
-        order { id note }
-        userErrors { field message }
-      }
+async function ensureOrderMetafieldDefinitions() {
+  const data = await graphql(`query OrderMetafieldDefinitions {
+    metafieldDefinitions(first: 100, ownerType: ORDER) {
+      nodes { namespace key type { name } }
     }
-  `;
-  const variables = { input: { id: gid, note } };
-  return graphql(mutation, variables);
+  }`);
+  const exists = data.metafieldDefinitions.nodes.some(definition =>
+    definition.namespace === 'middleware' &&
+    definition.key === 'status' &&
+    definition.type.name === 'single_line_text_field'
+  );
+  if (exists) return { created: false };
+
+  const result = await graphql(`mutation CreateOrderStatusDefinition($definition: MetafieldDefinitionInput!) {
+    metafieldDefinitionCreate(definition: $definition) {
+      createdDefinition { id name }
+      userErrors { field message code }
+    }
+  }`, {
+    definition: {
+      name: 'Middleware Status',
+      namespace: 'middleware',
+      key: 'status',
+      description: 'Internal order processing status used by the middleware dashboard.',
+      type: 'single_line_text_field',
+      ownerType: 'ORDER'
+    }
+  });
+  assertUserErrors(result.metafieldDefinitionCreate, 'Could not create order status metafield definition');
+  return { created: true, definition: result.metafieldDefinitionCreate.createdDefinition };
 }
 
-async function archiveOrder(orderId) {
-  const gid = toGidOrder(orderId);
-  // Not all Admin APIs provide an explicit archive mutation. As a safe fallback
-  // tag the order with "archived" and return the tags result so the UI can
-  // reflect archived state. This updates Shopify (tags) and marks locally.
-  return addTagsToOrder(gid, ['archived']);
-}
-
-// Retrieve fulfillment orders and their line items for a given Order ID (gid or numeric)
-async function getFulfillmentOrders(orderId, first = 10) {
-  const ownerId = String(orderId).startsWith('gid://') ? orderId : toGidOrder(orderId);
-  const query = `query getFulfillmentOrders($ownerId: ID!, $first: Int!) {
-    node(id: $ownerId) {
-      ... on Order {
+async function getOrder(orderId) {
+  const data = await graphql(`query OrderWorkflow($id: ID!) {
+    order(id: $id) {
+      id
+      name
+      createdAt
+      closedAt
+      cancelledAt
+      cancelReason
+      displayFinancialStatus
+      displayFulfillmentStatus
+      refundable
+      tags
+      note
+      customer {
         id
-        name
-        fulfillmentOrders(first: $first) {
-          edges {
-            node {
+        firstName
+        lastName
+        phone
+        defaultEmailAddress { emailAddress }
+        defaultAddress {
+          name
+          phone
+          address1
+          city
+          province
+          country
+        }
+      }
+      totalPriceSet { shopMoney { amount currencyCode } }
+      transactions(first: 20) {
+        id
+        kind
+        gateway
+        status
+        amountSet { shopMoney { amount currencyCode } }
+      }
+      lineItems(first: 100) {
+        nodes {
+          id
+          title
+          variantTitle
+          sku
+          quantity
+          currentQuantity
+          refundableQuantity
+          originalUnitPriceSet { shopMoney { amount currencyCode } }
+          image { url altText }
+          variant {
+            sku
+            barcode
+            image { url altText }
+          }
+        }
+      }
+      fulfillments(first: 20) {
+        id
+        status
+        displayStatus
+        createdAt
+        trackingInfo {
+          company
+          number
+          url
+        }
+        fulfillmentLineItems(first: 50) {
+          nodes {
+            quantity
+            lineItem {
               id
-              status
-              assignedLocation { location { id name } }
-              lineItems(first: 50) {
-                edges {
-                  node {
-                    id
-                    lineItem { id title quantity }
-                  }
-                }
-              }
+              title
+              variantTitle
+              sku
+              image { url altText }
+            }
+          }
+        }
+      }
+      fulfillmentOrders(first: 50) {
+        nodes {
+          id
+          status
+          assignedLocation {
+            location { id }
+          }
+          lineItems(first: 100) {
+            nodes {
+              id
+              productTitle
+              variantTitle
+              remainingQuantity
+              totalQuantity
+              lineItem { id }
+            }
+          }
+        }
+      }
+      middlewareStatus: metafield(namespace: "middleware", key: "status") {
+        id
+        value
+        compareDigest
+      }
+      cancelNote: metafield(namespace: "middleware", key: "cancel_note") {
+        id
+        value
+        compareDigest
+      }
+      externalMiddleware: metafield(namespace: "custom", key: "external_middleware") {
+        id
+        value
+        compareDigest
+      }
+    }
+  }`, { id: toOrderGid(orderId) });
+  return data.order;
+}
+
+async function addTags(orderId, tags) {
+  const result = await graphql(`mutation AddOrderTags($id: ID!, $tags: [String!]!) {
+    tagsAdd(id: $id, tags: $tags) {
+      node { id }
+      userErrors { field message }
+    }
+  }`, { id: toOrderGid(orderId), tags });
+  return assertUserErrors(result.tagsAdd, 'Could not add tags');
+}
+
+async function removeTags(orderId, tags) {
+  const result = await graphql(`mutation RemoveOrderTags($id: ID!, $tags: [String!]!) {
+    tagsRemove(id: $id, tags: $tags) {
+      node { id }
+      userErrors { field message }
+    }
+  }`, { id: toOrderGid(orderId), tags });
+  return assertUserErrors(result.tagsRemove, 'Could not remove tags');
+}
+
+async function getSuggestedRefund(orderId, refundLineItems) {
+  const data = await graphql(`query SuggestedRefund($id: ID!, $refundLineItems: [RefundLineItemInput!]!) {
+    order(id: $id) {
+      suggestedRefund(refundLineItems: $refundLineItems) {
+        amountSet { shopMoney { amount currencyCode } }
+        subtotalSet { shopMoney { amount currencyCode } }
+        totalTaxSet { shopMoney { amount currencyCode } }
+      }
+    }
+  }`, { id: toOrderGid(orderId), refundLineItems });
+  return data.order?.suggestedRefund;
+}
+
+async function getRecentOrdersPage({ first = 10, after, last, before } = {}) {
+  const backward = before && last;
+  const query = backward
+    ? `query RecentOrders($last: Int!, $before: String) {
+      orders(last: $last, before: $before, sortKey: CREATED_AT, reverse: true) {
+        edges { cursor node { id } }
+        pageInfo { hasNextPage hasPreviousPage startCursor endCursor }
+      }
+    }`
+    : `query RecentOrders($first: Int!, $after: String) {
+      orders(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
+        edges { cursor node { id } }
+        pageInfo { hasNextPage hasPreviousPage startCursor endCursor }
+      }
+    }`;
+  const variables = backward ? { last, before } : { first, after };
+  const data = await graphql(query, variables);
+  return data.orders;
+}
+
+async function getLocations() {
+  const data = await graphql(`query RefundLocations {
+    locations(first: 50) {
+      nodes { id name isActive fulfillsOnlineOrders }
+    }
+  }`);
+  return data.locations?.nodes || [];
+}
+
+async function getRefundableTransactions(orderId) {
+  const data = await graphql(`query RefundableTransactions($id: ID!) {
+    order(id: $id) {
+      transactions(first: 50) {
+        id
+        kind
+        status
+        gateway
+        amountSet { shopMoney { amount currencyCode } }
+        maximumRefundableV2 { amount currencyCode }
+      }
+    }
+  }`, { id: toOrderGid(orderId) });
+
+  return data.order?.transactions || [];
+}
+
+async function getRefundRestockLocations(orderId) {
+  const data = await graphql(`query RefundRestockLocations($id: ID!) {
+    order(id: $id) {
+      fulfillmentOrders(first: 50) {
+        nodes {
+          assignedLocation {
+            location { id }
+          }
+          lineItems(first: 100) {
+            nodes {
+              totalQuantity
+              remainingQuantity
+              lineItem { id }
             }
           }
         }
       }
     }
-  }`;
-  const variables = { ownerId, first };
-  const data = await graphql(query, variables);
-  return data && data.node && data.node.fulfillmentOrders ? data.node.fulfillmentOrders : null;
-}
+    locations(first: 1) {
+      nodes { id name }
+    }
+  }`, { id: toOrderGid(orderId) });
 
-// Create fulfillment(s) via Shopify GraphQL `fulfillmentCreate`
-async function createFulfillment(lineItemsByFulfillmentOrder, notifyCustomer = false) {
-  // Build an inline mutation string (no GraphQL input variable types) because this store
-  // does not support FulfillmentCreateInput/FulfillmentCreateV2Input.
-  // lineItemsByFulfillmentOrder: [{ fulfillmentOrderId, fulfillmentOrderLineItems: [{ id, quantity }] }, ...]
-  if (!Array.isArray(lineItemsByFulfillmentOrder) || lineItemsByFulfillmentOrder.length === 0) {
-    throw new Error('No fulfillment order line items provided');
+  const byLineItemId = {};
+  const fulfilledLineItemIds = [];
+  const fulfillmentOrders = data.order?.fulfillmentOrders?.nodes || [];
+
+  for (const fulfillmentOrder of fulfillmentOrders) {
+    const locationId = fulfillmentOrder.assignedLocation?.location?.id;
+    for (const node of fulfillmentOrder.lineItems?.nodes || []) {
+      const lineItemId = node.lineItem?.id;
+      if (!lineItemId) continue;
+      if (locationId && !byLineItemId[lineItemId]) {
+        byLineItemId[lineItemId] = toLocationGid(locationId);
+      }
+      const totalQuantity = Number(node.totalQuantity) || 0;
+      const remainingQuantity = Number(node.remainingQuantity) || 0;
+      if (totalQuantity > remainingQuantity && !fulfilledLineItemIds.includes(lineItemId)) {
+        fulfilledLineItemIds.push(lineItemId);
+      }
+    }
   }
 
-  // Helper to build the FO line items block
-  const foBlocks = lineItemsByFulfillmentOrder.map(fo => {
-    const foId = JSON.stringify(String(fo.fulfillmentOrderId));
-    const liBlocks = (fo.fulfillmentOrderLineItems || []).map(li => {
-      const liId = JSON.stringify(String(li.id));
-      const qty = Number(li.quantity || 1);
-      return `{ id: ${liId} quantity: ${qty} }`;
-    }).join(' ');
-    return `{
-      fulfillmentOrderId: ${foId}
-      fulfillmentOrderLineItems: [ ${liBlocks} ]
-    }`;
-  }).join(' ');
+  return {
+    byLineItemId,
+    fulfilledLineItemIds,
+    fallbackLocationId: data.locations?.nodes?.[0]?.id
+      ? toLocationGid(data.locations.nodes[0].id)
+      : null
+  };
+}
 
-  const notify = notifyCustomer ? 'true' : 'false';
-  const mutation = `mutation {
-    fulfillmentCreate(
-      fulfillment: {
-        notifyCustomer: ${notify}
-        lineItemsByFulfillmentOrder: [ ${foBlocks} ]
-      }
-    ) {
-      fulfillment {
+async function createRefund(input) {
+  const { idempotencyKey = createIdempotencyKey(), ...refundInput } = input;
+
+  const result = await graphql(`mutation RefundCreate($input: RefundInput!, $idempotencyKey: String!) {
+    refundCreate(input: $input) @idempotent(key: $idempotencyKey) {
+      refund {
         id
-        status
-      }
-      userErrors { message }
-    }
-  }`;
-
-  // Execute the inline mutation (no variables)
-  return await graphql(mutation);
-}
-
-// Hold a fulfillment order
-async function holdFulfillmentOrder(fulfillmentOrderId, reason = 'OTHER') {
-  // Introspect the mutation args for fulfillmentOrderHold and call it with appropriate variables.
-  try {
-    const introspect = `query { __type(name: \"Mutation\") { fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } } } }`;
-    const meta = await graphql(introspect);
-    const fields = meta && meta.__type && meta.__type.fields ? meta.__type.fields : [];
-    const foField = fields.find(f => f.name === 'fulfillmentOrderHold');
-    if (!foField) throw new Error('fulfillmentOrderHold not present in mutation type');
-
-    const args = foField.args || [];
-
-    // helper to get base type name
-    function baseTypeName(t) {
-      if (!t) return null;
-      if (t.name) return t.name;
-      if (t.ofType) return baseTypeName(t.ofType);
-      return null;
-    }
-
-    // helper to stringify GraphQL type from introspection
-    function typeToString(t) {
-      if (!t) return 'String';
-      if (t.kind === 'NON_NULL') return typeToString(t.ofType) + '!';
-      if (t.kind === 'LIST') return '[' + typeToString(t.ofType) + ']';
-      return t.name || 'String';
-    }
-
-    const varDefs = args.map(a => `$${a.name}: ${typeToString(a.type)}`).join(', ');
-    const callArgs = args.map(a => `${a.name}: $${a.name}`).join(', ');
-    const mutation = `mutation holdFO(${varDefs}) { fulfillmentOrderHold(${callArgs}) { fulfillmentOrder { id status } userErrors { field message } } }`;
-
-    const variables = {};
-    for (const a of args) {
-      const name = a.name;
-      const base = baseTypeName(a.type);
-      if (base === 'ID') variables[name] = fulfillmentOrderId;
-      else if (base && base.toLowerCase().includes('fulfillmentorderholdinput')) {
-        // inspect expected input fields and populate best-effort
-        const inputTypeName = base;
-        try {
-          const inMeta = await graphql(`query { __type(name: \"${inputTypeName}\") { inputFields { name type { name kind ofType { name kind } } } } }`);
-          const inputFields = inMeta && inMeta.__type && inMeta.__type.inputFields ? inMeta.__type.inputFields.map(f=>f.name) : [];
-          const obj = {};
-          for (const f of inputFields) {
-            const fn = f;
-            if (['reason','holdReason','fulfillmentHoldReason'].includes(fn)) obj[fn] = reason;
-            else if (['fulfillmentOrderId','fulfillment_order_id','fulfillmentOrder','orderId','id','fulfillment_order'].includes(fn)) obj[fn] = fulfillmentOrderId;
-          }
-          variables[name] = obj;
-        } catch (e) {
-          variables[name] = { fulfillmentOrderId, reason };
+        totalRefundedSet {
+          shopMoney { amount currencyCode }
         }
-      } else if (name.toLowerCase().includes('id')) {
-        variables[name] = fulfillmentOrderId;
       }
-    }
-
-    return await graphql(mutation, variables);
-  } catch (err) {
-    // As a last attempt, try the simple id-based mutation (some stores expect id: ID!)
-    try {
-      const simple = `mutation holdFO($id: ID!) { fulfillmentOrderHold(id: $id) { fulfillmentOrder { id status } userErrors { field message } } }`;
-      const r = await graphql(simple, { id: fulfillmentOrderId });
-      return r;
-    } catch (e2) {
-      // best-effort fallback: set metafield to ON_HOLD and rethrow original error
-      try {
-        const q = `query getFO($id: ID!){ node(id:$id){ ... on FulfillmentOrder { order { id } } } }`;
-        const data = await graphql(q, { id: fulfillmentOrderId });
-        const orderGid = data && data.node && data.node.order && data.node.order.id ? data.node.order.id : null;
-        if (orderGid) await setOrderMetafield(orderGid, 'middleware', 'status', 'single_line_text_field', 'ON_HOLD');
-      } catch (e3) { /* ignore */ }
-      throw err;
-    }
-  }
-}
-
-// Release a fulfillment order (undo hold) — introspection-aware with simple fallback
-async function releaseFulfillmentOrder(fulfillmentOrderId) {
-  try {
-    const introspect = `query { __type(name: \"Mutation\") { fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } } } }`;
-    const meta = await graphql(introspect);
-    const fields = meta && meta.__type && meta.__type.fields ? meta.__type.fields : [];
-    // find a mutation that looks like a release operation for fulfillment orders
-    let foField = fields.find(f => f.name === 'fulfillmentOrderRelease');
-    if (!foField) {
-      foField = fields.find(f => /fulfillment.*release/i.test(f.name));
-    }
-    if (!foField) throw new Error('fulfillmentOrderRelease not present in mutation type');
-
-    const args = foField.args || [];
-    function baseTypeName(t) {
-      if (!t) return null;
-      if (t.name) return t.name;
-      if (t.ofType) return baseTypeName(t.ofType);
-      return null;
-    }
-    function typeToString(t) {
-      if (!t) return 'String';
-      if (t.kind === 'NON_NULL') return typeToString(t.ofType) + '!';
-      if (t.kind === 'LIST') return '[' + typeToString(t.ofType) + ']';
-      return t.name || 'String';
-    }
-
-    const varDefs = args.map(a => `$${a.name}: ${typeToString(a.type)}`).join(', ');
-    const callArgs = args.map(a => `${a.name}: $${a.name}`).join(', ');
-    const mutationName = foField.name || 'fulfillmentOrderRelease';
-    const mutation = `mutation releaseFO(${varDefs}) { ${mutationName}(${callArgs}) { fulfillmentOrder { id status } userErrors { field message } } }`;
-
-    const variables = {};
-    for (const a of args) {
-      const name = a.name;
-      const base = baseTypeName(a.type);
-      if (base === 'ID') variables[name] = fulfillmentOrderId;
-      else if (name.toLowerCase().includes('id')) variables[name] = fulfillmentOrderId;
-      else {
-        // best-effort fields
-        variables[name] = fulfillmentOrderId;
-      }
-    }
-
-    return await graphql(mutation, variables);
-  } catch (err) {
-    // fallback: try common names
-    try {
-      const tries = [
-        'mutation releaseFO($id: ID!) { fulfillmentOrderReleaseHold(id: $id) { fulfillmentOrder { id status } userErrors { field message } } }',
-        'mutation releaseFO($id: ID!) { fulfillmentOrderRelease(id: $id) { fulfillmentOrder { id status } userErrors { field message } } }',
-        'mutation releaseFO($id: ID!) { fulfillmentOrderReleaseHold(id: $id) { fulfillmentOrder { id status } userErrors { field message } } }'
-      ];
-      for (const t of tries) {
-        try {
-          const r = await graphql(t, { id: fulfillmentOrderId });
-          return r;
-        } catch (e) { /* try next */ }
-      }
-      throw err;
-    } catch (e2) {
-      throw err;
-    }
-  }
-}
-
-// Set a single metafield on an owner (Order)
-async function setOrderMetafield(ownerId, namespace, key, type, value) {
-  const mutation = `mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
-    metafieldsSet(metafields: $metafields) {
-      metafields { id namespace key value }
       userErrors { field message }
     }
-  }`;
-  const variables = { metafields: [{ ownerId, namespace, key, type, value }] };
-  return graphql(mutation, variables);
+  }`, {
+    input: { ...refundInput, orderId: toOrderGid(refundInput.orderId) },
+    idempotencyKey
+  });
+
+  return assertUserErrors(result.refundCreate, 'Could not create refund').refund;
+}
+
+async function closeOrder(orderId) {
+  const result = await graphql(`mutation OrderClose($input: OrderCloseInput!) {
+    orderClose(input: $input) {
+      order { id closedAt }
+      userErrors { field message }
+    }
+  }`, { input: { id: toOrderGid(orderId) } });
+  return assertUserErrors(result.orderClose, 'Could not archive order').order;
+}
+
+async function openOrder(orderId) {
+  const result = await graphql(`mutation OrderOpen($input: OrderOpenInput!) {
+    orderOpen(input: $input) {
+      order { id closedAt }
+      userErrors { field message }
+    }
+  }`, { input: { id: toOrderGid(orderId) } });
+  return assertUserErrors(result.orderOpen, 'Could not unarchive order').order;
+}
+
+async function updateOrderNote(orderId, note) {
+  const result = await graphql(`mutation UpdateOrderNote($input: OrderInput!) {
+    orderUpdate(input: $input) {
+      order { id note }
+      userErrors { field message }
+    }
+  }`, { input: { id: toOrderGid(orderId), note } });
+  return assertUserErrors(result.orderUpdate, 'Could not update order note').order;
+}
+
+async function setOrderMetafield({ ownerId, namespace, key, value, compareDigest }) {
+  const input = {
+    ownerId: toOrderGid(ownerId),
+    namespace,
+    key,
+    type: 'single_line_text_field',
+    value
+  };
+  if (compareDigest !== undefined) input.compareDigest = compareDigest;
+
+  const result = await graphql(`mutation SetOrderMetafield($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      metafields { id namespace key value compareDigest }
+      userErrors { field message code }
+    }
+  }`, { metafields: [input] });
+  return assertUserErrors(result.metafieldsSet, 'Could not save metafield').metafields[0];
+}
+
+async function getFulfillmentOrders(orderId) {
+  const order = await getOrder(orderId);
+  return order ? order.fulfillmentOrders : null;
+}
+
+async function createFulfillment(lineItemsByFulfillmentOrder, notifyCustomer = false) {
+  const result = await graphql(`mutation CreateFulfillment($fulfillment: FulfillmentInput!) {
+    fulfillmentCreate(fulfillment: $fulfillment) {
+      fulfillment { id status }
+      userErrors { field message }
+    }
+  }`, {
+    fulfillment: { notifyCustomer, lineItemsByFulfillmentOrder }
+  });
+  return assertUserErrors(result.fulfillmentCreate, 'Could not create fulfillment').fulfillment;
+}
+
+async function cancelFulfillment(id) {
+  const result = await graphql(`mutation FulfillmentCancel($id: ID!) {
+    fulfillmentCancel(id: $id) {
+      fulfillment { id status }
+      userErrors { field message }
+    }
+  }`, { id });
+  return assertUserErrors(result.fulfillmentCancel, 'Could not cancel fulfillment').fulfillment;
+}
+
+async function holdFulfillmentOrder(id) {
+  const result = await graphql(`mutation HoldFulfillmentOrder($id: ID!, $fulfillmentHold: FulfillmentOrderHoldInput!) {
+    fulfillmentOrderHold(id: $id, fulfillmentHold: $fulfillmentHold) {
+      fulfillmentOrder { id status }
+      userErrors { field message }
+    }
+  }`, {
+    id,
+    fulfillmentHold: {
+      reason: 'OTHER',
+      reasonNotes: 'Placed on hold from Shopify Order Monitor'
+    }
+  });
+  return assertUserErrors(result.fulfillmentOrderHold, 'Could not hold fulfillment order').fulfillmentOrder;
+}
+
+async function releaseFulfillmentOrder(id) {
+  const result = await graphql(`mutation ReleaseFulfillmentOrder($id: ID!) {
+    fulfillmentOrderReleaseHold(id: $id) {
+      fulfillmentOrder { id status }
+      userErrors { field message code }
+    }
+  }`, { id });
+  return assertUserErrors(result.fulfillmentOrderReleaseHold, 'Could not release fulfillment order').fulfillmentOrder;
+}
+
+// Shopify native "In progress" — visible in Admin fulfillment column (API 2026-04+).
+async function reportFulfillmentProgress(fulfillmentOrderId, reasonNotes = 'Processing started from middleware') {
+  const result = await graphql(`mutation ReportFulfillmentProgress($id: ID!, $progressReport: FulfillmentOrderReportProgressInput!) {
+    fulfillmentOrderReportProgress(id: $id, progressReport: $progressReport) {
+      fulfillmentOrder { id status }
+      userErrors { field message code }
+    }
+  }`, {
+    id: fulfillmentOrderId,
+    progressReport: { reasonNotes: String(reasonNotes).slice(0, 256) }
+  });
+  return assertUserErrors(result.fulfillmentOrderReportProgress, 'Could not report fulfillment progress').fulfillmentOrder;
+}
+
+async function markOrderAsPaid(orderId) {
+  const result = await graphql(`mutation OrderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+    orderMarkAsPaid(input: $input) {
+      order { id displayFinancialStatus }
+      userErrors { field message }
+    }
+  }`, { input: { id: toOrderGid(orderId) } });
+  return assertUserErrors(result.orderMarkAsPaid, 'Could not mark order as paid').order;
+}
+
+async function waitForJob(jobId, attempts = 10, delayMs = 500) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const data = await graphql(`query JobStatus($id: ID!) {
+      job(id: $id) { id done }
+    }`, { id: jobId });
+    if (data.job?.done) return data.job;
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  throw Object.assign(new Error('Order cancellation is still processing. Refresh the order shortly.'), { statusCode: 202 });
+}
+
+async function cancelOrder({ orderId, reason, staffNote, restock = true, refundMethod, notifyCustomer = false }) {
+  const result = await graphql(`mutation OrderCancel(
+    $orderId: ID!,
+    $reason: OrderCancelReason!,
+    $restock: Boolean!,
+    $notifyCustomer: Boolean,
+    $staffNote: String,
+    $refundMethod: OrderCancelRefundMethodInput
+  ) {
+    orderCancel(
+      orderId: $orderId,
+      reason: $reason,
+      restock: $restock,
+      notifyCustomer: $notifyCustomer,
+      staffNote: $staffNote,
+      refundMethod: $refundMethod
+    ) {
+      job { id done }
+      orderCancelUserErrors { field message code }
+    }
+  }`, {
+    orderId: toOrderGid(orderId),
+    reason,
+    restock,
+    notifyCustomer,
+    staffNote: staffNote || undefined,
+    refundMethod
+  });
+  const payload = result.orderCancel;
+  const errors = payload?.orderCancelUserErrors || [];
+  if (errors.length) {
+    const error = new Error(errors.map(item => item.message).join('; '));
+    error.statusCode = 400;
+    throw error;
+  }
+  const job = payload?.job;
+  if (job?.id && !job.done) await waitForJob(job.id);
+  return job;
 }
 
 module.exports = {
   graphql,
-  addTagsToOrder,
-  addNoteToOrder,
-  archiveOrder,
+  toOrderGid,
+  getAccessScopes,
+  ensureOrderMetafieldDefinitions,
+  getOrder,
+  addTags,
+  removeTags,
+  getSuggestedRefund,
+  getRecentOrdersPage,
+  getLocations,
+  getRefundableTransactions,
+  getRefundRestockLocations,
+  createRefund,
+  closeOrder,
+  openOrder,
+  updateOrderNote,
+  setOrderMetafield,
   getFulfillmentOrders,
   createFulfillment,
+  cancelFulfillment,
   holdFulfillmentOrder,
   releaseFulfillmentOrder,
-  setOrderMetafield
+  reportFulfillmentProgress,
+  markOrderAsPaid,
+  cancelOrder
 };

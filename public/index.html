@@ -1,125 +1,73 @@
 <!doctype html>
 <html>
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Shopify Order Monitor</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <header class="header">
-      <h1>Shopify Order Monitor</h1>
-      <p id="stats"></p>
-    </header>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+    <main class="page-shell">
+      <header class="page-heading">
+        <div>
+          <p class="eyebrow">Shopify middleware</p>
+          <h1>Order Monitor</h1>
+          <p class="muted">Webhook-driven orders and fulfillment workflow.</p>
+        </div>
+        <div class="stat-card">
+          <span>Total orders</span>
+          <strong id="order-count">—</strong>
+        </div>
+      </header>
 
-    <main class="container">
       <section class="card">
-        <h2>Latest Orders</h2>
-        <table id="orders-table">
-          <thead>
-            <tr>
-              <th>Order</th>
-              <th>Customer</th>
-              <th>Email</th>
-              <th>Total</th>
-              <th>Created</th>
-              <th>Fulfillment</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+        <div class="card-heading">
+          <div><h2>Latest orders</h2><p class="muted">Automatically refreshes every five seconds.</p></div>
+          <div class="actions">
+            <button id="prev-orders" class="btn btn-small">Previous</button>
+            <button id="next-orders" class="btn btn-small">Next</button>
+            <button id="refresh-orders" class="btn btn-small">Refresh</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="orders-table">
+            <thead>
+              <tr>
+                <th>Order</th>
+                <th>Customer</th>
+                <th>Email</th>
+                <th>Total</th>
+                <th>Created</th>
+                <th>Order</th>
+                <th>Financial</th>
+                <th>Fulfillment</th>
+                <th>Delivery</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="10" class="empty-state">Loading orders…</td></tr>
+            </tbody>
+          </table>
+        </div>
       </section>
     </main>
-        <script>
-          const msgEl = document.createElement('div');
-          msgEl.id = 'action-msg';
-          msgEl.style.margin = '8px 0';
-          document.querySelector('.header').appendChild(msgEl);
 
-          function showMessage(text, isError = false) {
-            msgEl.textContent = text;
-            msgEl.style.color = isError ? '#b91c1c' : '#065f46';
-            setTimeout(() => { msgEl.textContent = ''; }, 3500);
-          }
-
-          async function load() {
-            try {
-              const res = await fetch('/api/orders');
-              const data = await res.json();
-              document.getElementById('stats').textContent = `Total orders: ${data.total}`;
-              const tbody = document.querySelector('#orders-table tbody');
-              tbody.innerHTML = '';
-              for (const o of data.orders) {
-                const id = o.id || encodeURIComponent(o.name || '');
-                const row = document.createElement('tr');
-                const status = (o.fulfillment_status || '').toUpperCase() || (o.middleware_status || 'UNFULFILLED');
-                const badgeColor = status === 'FULFILLED' ? 'green' : status === 'PARTIALLY_FULFILLED' ? 'orange' : status === 'ON_HOLD' ? 'red' : status === 'IN_PROGRESS' ? 'blue' : 'gray';
-                row.innerHTML = `
-                  <td><a href="/orders/${id}">${o.name || o.id || '-'}</a></td>
-                  <td>${o.customer || '-'}</td>
-                  <td>${o.email || '-'}</td>
-                  <td>${o.total || '-'}</td>
-                  <td>${o.created_at || '-'}</td>
-                  <td><span class="badge" style="background:${badgeColor}; color:#fff; padding:4px 8px; border-radius:12px; font-size:12px">${status}</span></td>
-                  <td>
-                    <button class="action-btn" data-action="tag" data-id="${id}">Add Tag</button>
-                    <button class="action-btn" data-action="note" data-id="${id}">Add Note</button>
-                    <button class="action-btn" data-action="archive" data-id="${id}">Archive</button>
-                  </td>
-                `;
-                tbody.appendChild(row);
-              }
-            } catch (err) {
-              console.error(err);
-              showMessage('Failed to load orders', true);
-            }
-          }
-
-          document.addEventListener('click', async (e) => {
-            if (!e.target.classList.contains('action-btn')) return;
-            const id = e.target.dataset.id;
-            const action = e.target.dataset.action;
-
-            try {
-              if (action === 'tag') {
-                const tag = prompt('Enter tag to add:');
-                if (!tag) return;
-                const res = await fetch(`/api/orders/${encodeURIComponent(id)}/tag`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ tags: [tag] })
-                });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || JSON.stringify(json));
-                showMessage('Tag added');
-              } else if (action === 'note') {
-                const note = prompt('Enter note to add:');
-                if (!note) return;
-                const res = await fetch(`/api/orders/${encodeURIComponent(id)}/note`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ note })
-                });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || JSON.stringify(json));
-                showMessage('Note added');
-              } else if (action === 'archive') {
-                if (!confirm('Archive this order?')) return;
-                const res = await fetch(`/api/orders/${encodeURIComponent(id)}/archive`, { method: 'POST' });
-                const json = await res.json();
-                if (!res.ok) throw new Error(json.error || JSON.stringify(json));
-                showMessage('Order archived');
-              }
-              await load();
-            } catch (err) {
-              console.error(err);
-              showMessage('Action failed: ' + (err.message || err), true);
-            }
-          });
-
-          load().catch(err => console.error(err));
-          setInterval(load, 5000);
-        </script>
+    <div id="dialog-backdrop" class="dialog-backdrop" hidden>
+      <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+        <div class="dialog-header">
+          <div><h2 id="dialog-title"></h2><p id="dialog-description" class="muted"></p></div>
+          <button id="dialog-close" class="icon-btn" aria-label="Close">×</button>
+        </div>
+        <div id="dialog-body" class="dialog-body"></div>
+        <p id="dialog-message" class="form-message"></p>
+        <div class="dialog-footer">
+          <button id="dialog-cancel" class="btn">Cancel</button>
+          <button id="dialog-confirm" class="btn btn-primary">Save</button>
+        </div>
+      </section>
+    </div>
+    <script src="/dashboard.js"></script>
   </body>
-  </html>
+</html>
