@@ -12,11 +12,11 @@ This project focuses on the backend side of Shopify development rather than stor
 
 ## Dashboard
 
-![Dashboard Screenshot](./screenshots/dashboard.png)
+![Dashboard Screenshot](./screenshots/Middleware-Dashboard-SS.png)
 
 ## Order Details
 
-![Order Details Screenshot](./screenshots/order-details.png)
+![Order Details Screenshot](./screenshots/Middleware-order-page-SS.png)
 
 ---
 
